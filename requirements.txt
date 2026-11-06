@@ -1,0 +1,7 @@
+# Tested runtime set. CPython 3.12-3.14; 3.13 recommended.
+# Includes SlangPy's typing_extensions dependency to keep installs repeatable.
+slangpy==0.43.1
+numpy==2.5.4
+Pillow==12.3.0
+imageio-ffmpeg==0.6.0
+typing_extensions==4.16.0
