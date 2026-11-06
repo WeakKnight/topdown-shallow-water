@@ -22,7 +22,7 @@ def parse_args(argv=None):
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=800)
     p.add_argument("--resolution", type=int, default=768)
-    p.add_argument("--extent", type=float, default=24.0, help="Square world-space RT width in meters")
+    p.add_argument("--extent", type=float, default=32.0, help="Camera-centered simulation width in meters; independent of view size")
     p.add_argument("--wave-speed", type=float, default=3.2)
     p.add_argument("--damping", type=float, default=1.3)
     p.add_argument("--strength", type=float, default=0.85)
@@ -37,7 +37,9 @@ def parse_args(argv=None):
     p.add_argument("--video", type=Path, help="Export rendered frames as H.264 MP4, without UI")
     p.add_argument("--seconds", type=float, default=20.0, help="Video duration")
     p.add_argument("--fps", type=int, choices=(30, 60), default=60)
-    p.add_argument("--no-follow", action="store_true")
+    p.add_argument("--no-follow", action="store_true", help="Start with a free camera")
+    p.add_argument("--camera-center", type=float, nargs=2, metavar=("X", "Z"), help="Start free camera at world XZ")
+    p.add_argument("--domain-debug", action="store_true", help="Show simulation boundary and absorption band")
     p.add_argument("--foot-debug", action="store_true")
     p.add_argument("--open-water", action="store_true", help="All-wet domain with an absorbing outer border")
     p.add_argument("--view", choices=VIEWS, default="water")
@@ -66,12 +68,14 @@ def parse_args(argv=None):
         p.error("width and height must be in [1, 8192]")
     if args.frames < 1 or args.window_frames < 0:
         p.error("frames must be positive; window-frames must be nonnegative")
-    for name, low, high in (("cadence", 0.6, 4.0), ("lift_height", 0.04, 0.6), ("zoom", 1.0, 5.0),
+    for name, low, high in (("cadence", 0.6, 4.0), ("lift_height", 0.04, 0.6), ("zoom", 0.5, 5.0),
                             ("ior", 1.0, 1.6), ("roughness", 0.02, 0.45), ("absorption", 0.0, 4.0),
                             ("sun_azimuth", -180.0, 180.0), ("sun_elevation", 5.0, 85.0)):
         value = getattr(args, name)
         if not math.isfinite(value) or not low <= value <= high:
             p.error(f"{name} must be in [{low}, {high}]")
+    if args.camera_center is not None and not all(math.isfinite(v) and abs(v) <= 1e6 for v in args.camera_center):
+        p.error("camera-center must be finite and within +/-1,000,000 m")
     if not math.isfinite(args.seconds) or not 0 < args.seconds <= 600:
         p.error("seconds must be in (0, 600]")
     if args.video:
@@ -104,9 +108,12 @@ class App:
         self.water.detail = 0.0 if args.no_detail else 0.25
         self.water.zoom, self.water.follow = args.zoom, not args.no_follow
         self.water.foot_debug = args.foot_debug
+        self.water.domain_debug = args.domain_debug
+        if args.camera_center is not None:
+            self.water.set_camera(args.camera_center)
         self.gait = Biped(args.cadence, args.lift_height)
         self.gait.reset(depth=args.water_depth, open_water=args.open_water)
-        self.npcs = [Wanderer(i, args.extent, args.water_depth, args.open_water) for i in range(args.npcs)]
+        self.npcs = [Wanderer(i, 24.0, args.water_depth, args.open_water) for i in range(args.npcs)]
         self.water.feet = self.gait.feet + [foot for npc in self.npcs for foot in npc.gait.feet]
         self.position = np.zeros(2)
         self.target = None
@@ -120,9 +127,9 @@ class App:
         self.frame_count = 0
 
     def reset(self):
-        self.water.reset()
         self.position[:] = 0
         self.water.player = (0.0, 0.0)
+        self.water.reset()
         self.gait.reset(depth=self.water.settings.water_depth, open_water=self.water.settings.open_water)
         for npc in self.npcs:
             npc.reset(self.water.settings.water_depth, self.water.settings.open_water)
@@ -131,6 +138,14 @@ class App:
         self.auto_phase = self.accumulator = self.impulse = 0.0
 
     def advance(self, encoder, elapsed):
+        # Camera input remains live while paused. Its window always follows the
+        # observed area, regardless of which actor (if any) is being followed.
+        k = spy.KeyCode
+        pan = np.array([int(k.right in self.keys) - int(k.left in self.keys),
+                        int(k.down in self.keys) - int(k.up in self.keys)], dtype=float)
+        if np.any(pan):
+            speed = 18.0 if k.left_shift in self.keys else 7.0
+            self.water.set_camera(self.water.camera_center + pan / np.linalg.norm(pan) * speed * min(elapsed, 0.1))
         if self.paused:
             return
         # Cap wall-time debt after dragging/resizing the window (no spiral of death).
@@ -154,8 +169,6 @@ class App:
             elif self.target is not None:
                 delta = self.target - self.position
                 self.position += delta * min(1.0, speed * dt / max(np.linalg.norm(delta), 1e-8))
-            limit = self.water.settings.extent * 0.5 - 1.2
-            self.position = np.clip(self.position, -limit, limit)
             feet = self.gait.update(self.position, (self.position - previous) / dt, dt,
                                    self.water.settings.water_depth, self.water.settings.open_water)
             feet = list(feet)
@@ -211,7 +224,7 @@ class App:
         spy.ui.Button(panel, "Foot outlines + targets [B]",
                       callback=lambda: setattr(self.water, "foot_debug", not self.water.foot_debug))
         spy.ui.Button(panel, "Follow camera [F]",
-                      callback=lambda: setattr(self.water, "follow", not self.water.follow))
+                      callback=self.toggle_follow)
         for label, attr, minimum, maximum in (("Wave speed", "wave_speed", 0.5, 8.0),
                 ("Damping", "damping", 0.0, 3.0), ("Interaction", "strength", 0.0, 5.0),
                 ("Water depth (m)", "water_depth", 0.0, 0.25),
@@ -224,7 +237,7 @@ class App:
                                               ("Foot lift (m)", "lift_height", 0.04, 0.6)):
             spy.ui.SliderFloat(panel, label, min=minimum, max=maximum, value=getattr(self.gait, attr),
                               callback=lambda value, attr=attr: setattr(self.gait, attr, value))
-        spy.ui.SliderFloat(panel, "Zoom", min=1.0, max=5.0, value=self.water.zoom,
+        spy.ui.SliderFloat(panel, "Zoom", min=0.5, max=5.0, value=self.water.zoom,
                           callback=lambda value: setattr(self.water, "zoom", value))
         spy.ui.SliderFloat(panel, "Normal strength", min=0.0, max=5.0, value=self.water.normal_strength,
                           callback=lambda value: setattr(self.water, "normal_strength", value))
@@ -250,6 +263,37 @@ class App:
         spy.ui.Text(optics, "P: freeze for A/B comparison")
         spy.ui.Text(optics, "V: transmission / reflection / F")
         spy.ui.Text(optics, "Fresnel view: raw 0..1 weights")
+        camera = spy.ui.Window(self.ui.screen, "Camera / local simulation",
+            spy.float2(max(340, self.window.width - 302), 470) * self.ui_scale,
+            spy.float2(286, max(120, min(310, self.window.height - 486))) * self.ui_scale)
+        self.camera_status = spy.ui.Text(camera, "")
+        spy.ui.Button(camera, "Follow / free camera [F]", callback=self.toggle_follow)
+        spy.ui.Button(camera, "Return to player [Home]", callback=self.return_camera)
+        spy.ui.Button(camera, "Window boundary [H]", callback=self.toggle_domain)
+        spy.ui.Button(camera, "Cut 64m right [L]", callback=lambda: self.cut_camera(64))
+        spy.ui.Text(camera, "Arrows: pan / Shift: fast")
+        spy.ui.Text(camera, "1/2/3: NPC views   J/L: cut -/+64m")
+        spy.ui.Text(camera, "Cyan: window / amber: sponge")
+        spy.ui.Text(camera, "Zoom < 1 to inspect full window")
+
+    def toggle_follow(self):
+        if self.water.follow:
+            self.water.set_camera(self.water.camera_center)
+        else:
+            self.water.follow = True
+
+    def return_camera(self):
+        self.water.follow = True
+
+    def toggle_domain(self):
+        self.water.domain_debug = not self.water.domain_debug
+
+    def cut_camera(self, distance):
+        self.water.set_camera(self.water.camera_center + np.array([distance, 0.0]))
+
+    def view_npc(self, index):
+        if index < len(self.npcs):
+            self.water.set_camera(self.npcs[index].position)
 
     def toggle_refraction(self):
         self.water.refraction = not self.water.refraction
@@ -292,7 +336,17 @@ class App:
         elif event.key == k.b:
             self.water.foot_debug = not self.water.foot_debug
         elif event.key == k.f:
-            self.water.follow = not self.water.follow
+            self.toggle_follow()
+        elif event.key == k.home:
+            self.return_camera()
+        elif event.key == k.h:
+            self.toggle_domain()
+        elif event.key == k.j:
+            self.cut_camera(-64)
+        elif event.key == k.l:
+            self.cut_camera(64)
+        elif event.key in (k.key1, k.key2, k.key3):
+            self.view_npc((k.key1, k.key2, k.key3).index(event.key))
         elif event.key == k.i:
             self.toggle_refraction()
         elif event.key == k.o:
@@ -309,7 +363,7 @@ class App:
         if self.ui.handle_mouse_event(ui_event):
             return
         if event.is_scroll():
-            self.water.zoom = float(np.clip(self.water.zoom * math.exp(event.scroll.y * 0.1), 1, 5))
+            self.water.zoom = float(np.clip(self.water.zoom * math.exp(event.scroll.y * 0.1), 0.5, 5))
         if event.is_button_down() and event.button == spy.MouseButton.left:
             # Window events are logical pixels; rendering may use a HiDPI surface.
             x = event.pos.x * self.water.width / self.window.width
@@ -372,6 +426,10 @@ class App:
                 labels.append(f"{name}: {'SWING' if foot.swinging else 'PLANTED'} / {'WET' if wet else 'DRY'}")
             self.foot_status.text = "\n".join(labels)
             self.optics_status.text = f"Refraction: {'ON' if self.water.refraction else 'OFF'}\nReflection: {'ON' if self.water.reflection else 'OFF'}"
+            center = self.water.camera_center
+            self.camera_status.text = (f"{'FOLLOW PLAYER' if self.water.follow else 'FREE CAMERA'} | {center[0]:.1f}, {center[1]:.1f}m\n"
+                f"RT {s.extent:g}m / active feet: {self.water.active_foot_count}\n"
+                f"Scrolls: {self.water.scroll_count} / clears: {self.water.cut_count}")
             self.ui.begin_frame(round(self.window.width * self.ui_scale),
                                 round(self.window.height * self.ui_scale))
             self.ui.end_frame(texture, encoder)

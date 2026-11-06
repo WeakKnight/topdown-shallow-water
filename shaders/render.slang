@@ -7,6 +7,10 @@ RWTexture2D<float4> g_output;
 RWTexture2D<float4> g_opticalData; // F, underwater path (m), transmitted ID, reflected ID.
 uniform uint g_resolution;
 uniform float g_extent;
+uniform float2 g_domainCenter;
+uniform float g_edgeWidth;
+uniform float g_cameraSpan;
+uniform uint g_domainDebug;
 uniform float g_time;
 uniform float2 g_player;
 uniform FootData g_feet[8];
@@ -28,19 +32,27 @@ uniform uint g_refraction;
 uniform uint g_reflection;
 uniform uint g_floorGrid;
 
+float4 stateTexel(int2 cell)
+{
+    if (any(cell < 0) || any(cell >= int(g_resolution))) return float4(0);
+    return g_state[cell];
+}
+
 float4 sampleState(float2 p)
 {
-    float2 texel = (p / g_extent + 0.5) * g_resolution - 0.5;
+    float2 local = p - g_domainCenter;
+    float edge = g_extent * 0.5 - max(abs(local.x), abs(local.y));
+    if (edge <= 0) return float4(0);
+    float2 texel = (local / g_extent + 0.5) * g_resolution - 0.5;
     int2 cell = int2(floor(texel));
     float2 t = frac(texel);
-    int hi = int(g_resolution) - 1;
-    return lerp(lerp(g_state[clamp(cell, 0, hi)], g_state[clamp(cell + int2(1, 0), 0, hi)], t.x),
-                lerp(g_state[clamp(cell + int2(0, 1), 0, hi)], g_state[clamp(cell + 1, 0, hi)], t.x), t.y);
+    float4 state = lerp(lerp(stateTexel(cell), stateTexel(cell + int2(1, 0)), t.x),
+                        lerp(stateTexel(cell + int2(0, 1)), stateTexel(cell + 1), t.x), t.y);
+    return state * smoothstep(0.0, g_edgeWidth, edge);
 }
 
 float depthAt(float2 p)
 {
-    if (any(abs(p) >= g_extent * 0.5)) return 0;
     return g_openWater != 0 ? g_depth : g_depth * smoothstep(0.0, 0.35, waterMargin(p));
 }
 
@@ -180,8 +192,7 @@ float terrainHit(float3 origin, float3 direction)
     float2 a = (origin + direction * low).xz;
     float2 b = (origin + direction * high).xz;
     // Conservative flat-region fast path. waterMargin has Lipschitz bound < 2.
-    bool domainInterior = all(abs(a) < g_extent * 0.5) && all(abs(b) < g_extent * 0.5);
-    if (domainInterior && (g_openWater != 0 || waterMargin(a) > 0.35 + 2 * length(b - a)))
+    if (g_openWater != 0 || waterMargin(a) > 0.35 + 2 * length(b - a))
         return high;
     // Find the first bracket across the shallow sloping bank, then bisect it.
     float end = high;
@@ -288,7 +299,7 @@ void render(uint3 tid : SV_DispatchThreadID)
     float2 screen = (float2(tid.xy) + 0.5) / float2(size) * 2 - 1;
     screen.y = -screen.y;
     float aspect = float(size.x) / size.y;
-    float halfWidth = g_extent * 0.59 * max(1.0, aspect / 1.65) / g_zoom;
+    float halfWidth = g_cameraSpan * 0.59 * max(1.0, aspect / 1.65) / g_zoom;
     float3 incident = g_topDown != 0 ? float3(0, -1, 0) : normalize(float3(0, -1, -0.78));
     float3 up = float3(0, -incident.z, incident.y);
     float3 origin = -incident * 30 + float3(screen.x * halfWidth, 0, 0)
@@ -351,6 +362,15 @@ void render(uint3 tid : SV_DispatchThreadID)
             color = footOverlay(color, p, g_feet[i], footColor(i));
         float rootMark = 1 - smoothstep(0.01, 0.025, abs(length(p - g_player) - 0.07));
         color = lerp(color, float3(0.6), rootMark * 0.6);
+    }
+    if (g_domainDebug != 0)
+    {
+        float2 d = abs(p - g_domainCenter);
+        float edge = g_extent * 0.5 - max(d.x, d.y);
+        float line = 1 - smoothstep(0.025, 0.065, abs(edge));
+        float inner = 1 - smoothstep(0.025, 0.065, abs(edge - g_edgeWidth));
+        color = lerp(color, float3(0.1, 1.2, 1.4), line * 0.9);
+        color = lerp(color, float3(1.2, 0.65, 0.04), inner * 0.8);
     }
     g_opticalData[tid.xy] = opticalData;
     if (g_view != 6)

@@ -51,7 +51,7 @@ class CrowdChecks(unittest.TestCase):
         device.submit_command_buffer(encoder.finish())
         state, optics = w.read_state(), w.read_optics()
         for foot, material in zip(w.feet, (1, 2, 5, 6, 7, 8, 9, 10)):
-            cell = ((foot.position[[0, 2]] / 24 + 0.5) * 256).astype(int)
+            cell = ((foot.position[[0, 2]] / w.settings.extent + 0.5) * 256).astype(int)
             x, z = cell
             self.assertGreater(np.max(np.abs(state[z-1:z+2, x-1:x+2, 1])), 0.01)
             self.assertGreater(np.count_nonzero(optics[..., 2] == material), 2)

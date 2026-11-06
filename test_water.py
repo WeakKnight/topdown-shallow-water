@@ -88,14 +88,14 @@ class GPUChecks(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = create_device()
-        cls.water = Water(cls.device, Settings(resolution=128), width=97, height=65)
+        cls.water = Water(cls.device, Settings(resolution=128, extent=24.0), width=97, height=65)
 
     @classmethod
     def tearDownClass(cls):
         cls.device.wait()
 
     def setUp(self):
-        self.water.settings = Settings(resolution=128)
+        self.water.settings = Settings(resolution=128, extent=24.0)
         self.water.player = (0.0, 0.0)
         self.water.reset()
         self.gait = Biped()
